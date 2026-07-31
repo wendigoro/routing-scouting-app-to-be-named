@@ -106,6 +106,9 @@ final class ProprietaryMapEngine {
     if (warmThreadStarted) {
       return;
     }
+    // Prime planet tile store up front so map status reflects true source
+    // readiness even before the first uncached scene/render request.
+    PlanetTileStore.ready();
     warmThreadStarted = true;
     Thread warm = new Thread(() -> {
       while (true) {
@@ -153,6 +156,20 @@ final class ProprietaryMapEngine {
 
   private static long cellKey(int z, int x, int y) {
     return ((long) z << 58) | ((long) x << 29) | (y & 0x1FFFFFFFL);
+  }
+  private static int zoomFromCellKey(long key) {
+    return (int) (key >>> 58);
+  }
+
+  private static void evictFinerZoomLayers(int zoom) {
+    synchronized (CELL_LRU) {
+      var it = CELL_LRU.entrySet().iterator();
+      while (it.hasNext()) {
+        if (zoomFromCellKey(it.next().getKey()) > zoom) {
+          it.remove();
+        }
+      }
+    }
   }
 
   static MapModel.CellData getCell(int z, int x, int y, boolean allowNetwork, boolean allowOverpass) {
@@ -649,13 +666,18 @@ final class ProprietaryMapEngine {
     double cosLat = Math.max(0.08, Math.cos(Math.toRadians(lat)));
     for (int z : ZOOM_LADDER) {
       double tileSpanM = EARTH_CIRCUMFERENCE_M * cosLat / (1L << z);
-      if (tileSpanM * SCENE_MAX_TILES_PER_AXIS >= 2.0 * radiusM) {
+      if (tileSpanM * sceneMaxTilesPerAxis(z) >= 2.0 * radiusM) {
         return z;
       }
     }
     return ZOOM_LADDER[ZOOM_LADDER.length - 1];
   }
 
+  private static int sceneMaxTilesPerAxis(int zoom) {
+    // Keep close-in requests lighter for mobile rendering, but allow broader
+    // route-scale views to include more surrounding context.
+    return zoom >= 14 ? SCENE_MAX_TILES_PER_AXIS : 7;
+  }
   private static int snapToLadder(int zoom) {
     int best = ZOOM_LADDER[0];
     int bestDiff = Integer.MAX_VALUE;
@@ -669,50 +691,49 @@ final class ProprietaryMapEngine {
     return best;
   }
 
-  /** Per-zoom feature class filter (roads thin out as the map zooms out). */
+  /** Per-zoom road filter. Minor classes are dropped earlier so low-zoom views emphasize major roads. */
   private static boolean includeRoadAtZoom(String clazz, int z) {
-    if (z >= 14) {
+    if (z >= 15) {
       return true;
     }
     switch (clazz) {
       case "motorway":
         return true;
       case "primary":
-        return z >= 7;
+        return z >= 11;
       case "secondary":
       case "rail":
-        return z >= 10;
-      case "tertiary":
-        return z >= 11;
-      case "residential":
         return z >= 12;
+      case "tertiary":
+        return z >= 13;
+      case "residential":
+        return z >= 14;
       default: // service, path
-        return false;
+        return z >= 15;
     }
   }
 
   private static boolean includeBuildingsAtZoom(int z) {
-    return z >= 13;
+    return z >= 12;
   }
 
   private static boolean includeAreaAtZoom(String kind, int z) {
-    if (z >= 13) {
-      return true;
-    }
-    return "water".equals(kind) || (z >= 9 && "park".equals(kind));
+    return true;
   }
 
   /** Smallest feature bbox span (degrees) worth emitting at this zoom (~sub-pixel cull). */
   private static double minFeatureSpanDeg(int zoom) {
-    return zoom >= 14 ? 0.0 : (360.0 / (1 << zoom)) / 300.0;
+    return zoom >= 14
+        ? (360.0 / (1 << zoom)) / 1200.0
+        : (360.0 / (1 << zoom)) / 500.0;
   }
 
   /** Minimum spacing (degrees) between emitted points at this zoom. */
   private static double minPointSpacingDeg(int zoom) {
     if (zoom >= 14) {
-      return 0.0;
+      return (360.0 / (1 << zoom)) / 1600.0;
     }
-    return (360.0 / (1 << zoom)) / (zoom >= 13 ? 400.0 : 250.0);
+    return (360.0 / (1 << zoom)) / (zoom >= 13 ? 650.0 : 420.0);
   }
 
   /** Coordinate decimals needed at this zoom (fewer digits = lighter payloads). */
@@ -795,7 +816,8 @@ final class ProprietaryMapEngine {
     int zoom = zoomOverride >= 3 && zoomOverride <= CELL_ZOOM
         ? snapToLadder(zoomOverride)
         : zoomForRadius(lat, radius);
-    List<MapModel.CellData> cells = collectCells(lat, lon, radius, SCENE_MAX_TILES_PER_AXIS, zoom);
+    evictFinerZoomLayers(zoom);
+    List<MapModel.CellData> cells = collectCells(lat, lon, radius, sceneMaxTilesPerAxis(zoom), zoom);
     double latPad = (radius * 1.2) / 110540.0;
     double lonPad = (radius * 1.2) / (111320.0 * Math.max(0.2, Math.cos(Math.toRadians(lat))));
     double minLat = lat - latPad;
@@ -829,10 +851,9 @@ final class ProprietaryMapEngine {
     boolean first = true;
     for (MapModel.CellData c : cells) {
       for (MapModel.Area a : c.areas) {
-        // Parks/landuse need a much larger footprint than water to survive zoom-out.
-        double spanNeeded = "water".equals(a.kind) ? (zoom <= 12 ? minSpan * 3 : minSpan) : minSpan * 10;
+        double spanNeeded = minSpan;
         if (!includeAreaAtZoom(a.kind, zoom)
-            || !anyPointInBox(a.pts, minLat, minLon, maxLat, maxLon)
+            || !intersectsView(a.pts, minLat, minLon, maxLat, maxLon)
             || !spansEnough(a.pts, spanNeeded)) {
           continue;
         }
@@ -855,8 +876,7 @@ final class ProprietaryMapEngine {
     for (MapModel.CellData c : cells) {
       for (MapModel.Road r : c.roads) {
         if (!includeRoadAtZoom(r.clazz, zoom)
-            || !anyPointInBox(r.pts, minLat, minLon, maxLat, maxLon)
-            || !spansEnough(r.pts, minSpan)) {
+            || !intersectsView(r.pts, minLat, minLon, maxLat, maxLon)) {
           continue;
         }
         double[] pts = decimate(r.pts, minSpacing);
@@ -881,7 +901,12 @@ final class ProprietaryMapEngine {
         break;
       }
       for (MapModel.Building b : c.buildings) {
-        if (!anyPointInBox(b.pts, minLat, minLon, maxLat, maxLon)) {
+        if (!intersectsView(b.pts, minLat, minLon, maxLat, maxLon)
+            || !spansEnough(b.pts, minSpan)) {
+          continue;
+        }
+        double[] pts = decimate(b.pts, minSpacing);
+        if (pts.length < 6) {
           continue;
         }
         if (!first) {
@@ -890,7 +915,7 @@ final class ProprietaryMapEngine {
         first = false;
         buildingCount++;
         sb.append("{\"h\":").append(round1(b.heightM)).append(",\"p\":");
-        appendPts(sb, b.pts);
+        appendPts(sb, pts, decimals);
         sb.append('}');
       }
     }
@@ -964,6 +989,28 @@ final class ProprietaryMapEngine {
     return false;
   }
 
+  private static boolean bboxIntersectsBox(double[] pts, double minLat, double minLon, double maxLat, double maxLon) {
+    if (pts == null || pts.length < 2) {
+      return false;
+    }
+    double featureMinLat = Double.MAX_VALUE;
+    double featureMaxLat = -Double.MAX_VALUE;
+    double featureMinLon = Double.MAX_VALUE;
+    double featureMaxLon = -Double.MAX_VALUE;
+    for (int i = 0; i + 1 < pts.length; i += 2) {
+      featureMinLat = Math.min(featureMinLat, pts[i]);
+      featureMaxLat = Math.max(featureMaxLat, pts[i]);
+      featureMinLon = Math.min(featureMinLon, pts[i + 1]);
+      featureMaxLon = Math.max(featureMaxLon, pts[i + 1]);
+    }
+    return featureMaxLat >= minLat && featureMinLat <= maxLat
+        && featureMaxLon >= minLon && featureMinLon <= maxLon;
+  }
+
+  private static boolean intersectsView(double[] pts, double minLat, double minLon, double maxLat, double maxLon) {
+    return anyPointInBox(pts, minLat, minLon, maxLat, maxLon)
+        || bboxIntersectsBox(pts, minLat, minLon, maxLat, maxLon);
+  }
   // ---- Server-side verification renderer (Java2D) ----
 
   static byte[] renderPng(
@@ -1246,6 +1293,9 @@ final class ProprietaryMapEngine {
   // ---- Status + jurisdiction shard prefetch ----
 
   static String statusJson() {
+    // Opportunistically probe PMTiles readiness (PlanetTileStore has internal
+    // backoff, so this remains lightweight when upstream is unavailable).
+    PlanetTileStore.ready();
     StringBuilder sb = new StringBuilder(1 << 12);
     sb.append("{\"status\":\"ok\",\"ts\":\"").append(Instant.now()).append("\",");
     sb.append("\"cell_zoom\":").append(CELL_ZOOM).append(",");

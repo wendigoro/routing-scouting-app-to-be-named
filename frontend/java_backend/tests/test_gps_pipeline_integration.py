@@ -20,7 +20,7 @@ class GpsPipelineIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.repo_dir = Path("/home/gibi/Desktop/frontend/java_backend")
-        cls.server_source = cls.repo_dir / "ScannerBackendServer.java"
+        cls.server_source = cls.repo_dir / "BackendServer.java"
         cls.build_dir = Path(tempfile.mkdtemp(prefix="scanner-backend-test-build-"))
         cls.port = _free_port()
         cls.log_file = Path(tempfile.mkstemp(prefix="scanner-backend-test-log-", suffix=".log")[1])
@@ -50,7 +50,7 @@ class GpsPipelineIntegrationTests(unittest.TestCase):
         log_handle = open(cls.log_file, "w", encoding="utf-8")
         cls._log_handle = log_handle
         cls.proc = subprocess.Popen(
-            ["java", "-cp", str(cls.build_dir), "ScannerBackendServer"],
+            ["java", "-cp", str(cls.build_dir), "BackendServer"],
             cwd=str(cls.repo_dir),
             env=env,
             stdout=log_handle,
